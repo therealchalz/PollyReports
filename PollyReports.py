@@ -31,6 +31,8 @@
 # Thanks to Jose Jachuf, who provided the titleband implementation and
 # the initial version of the Image class, and who implemented Unicode support.
 
+from reportlab.lib.utils import simpleSplit
+
 
 """
     PollyReports.py
@@ -52,53 +54,39 @@
 """
 
 
-class Renderer(object):
-
-    def __init__(self, parent, pos, font, text, align, height, onrender, width):
+class BaseRenderer(object):
+    def __init__(self, parent=None, pos=None, onrender=None):
         self.parent = parent
-        self.pos = pos
+        self.pos = pos or (0,0)
+        self.onrender = onrender
+        
+    def render(self, offset, canvas):
+        if self.onrender is not None:
+            self.onrender(self)
+
+    def applyoffset(self, offset):
+        self.pos = (self.pos[0], self.pos[1] + offset)
+        return self
+
+class TextRenderer(BaseRenderer):
+
+    def __init__(self, font, text, align, height, width, **kwargs):
+        BaseRenderer.__init__(self, **kwargs)
         self.font = font
         self.align = align
         self.lineheight = height
-        self.onrender = onrender
         self.width = width
-
-        # Dirty tricks here.
-        # We could use canvas.stringWidth IF we had a canvas at this
-        # point, but we don't.  So, we make the rash assumption that
-        # characters in the current font are 2/3 as wide as they are
-        # tall (which is probably BS).
 
         if self.width is None:
             self.lines = text.split("\n")
         else:
-            paragraphs = text.split("\n")
-            lines = []
-            curline = []
-            for para in paragraphs:
-                words = para.split()
-                for word in words:
-                    if not curline:
-                        curline = [ word ]
-                    else:
-                        if self.calcwidth(" ".join(curline + [ word ])) > width:
-                            lines.append(" ".join(curline))
-                            curline = [ word ]
-                        else:
-                            curline.append(word)
-                if curline:
-                    lines.append(" ".join(curline))
-                    curline = []
-            self.lines = lines
+            self.lines = simpleSplit(text, *self.font, maxWidth=self.width)
 
         self.height = height * len(self.lines)
 
-    def calcwidth(self, s):
-        return len(s) * int(self.font[1] * 2 / 3 + 0.5)
-
     def render(self, offset, canvas):
-        if self.onrender is not None:
-            self.onrender(self)
+        BaseRenderer.render(self, offset, canvas)
+
         leftmargin = self.parent.report.leftmargin
         canvas.setFont(*self.font)
         for text in self.lines:
@@ -124,12 +112,14 @@ class Renderer(object):
                     text)
             offset += self.lineheight
 
-    def applyoffset(self, offset):
-        self.pos = (self.pos[0], self.pos[1] + offset)
-        return self
+class BaseElement(object):
+
+    def __init__(self, pos=None, onrender = None):
+        self.pos = pos or (0,0)
+        self.onrender = onrender
 
 
-class Element(object):
+class TextElement(BaseElement):
 
     text_conversion = str
 
@@ -140,15 +130,15 @@ class Element(object):
     # all three should not be submitted at the same time,
     #   but if they are, getvalue overrides key overrides text.
 
-    def __init__(self, pos = None, font = None, text = None,
+    def __init__(self, pos, font, text = None,
                  key = None, getvalue = None, sysvar = None,
                  align = "left", format = str, width = None,
-                 leading = None, onrender = None):
+                 leading = None, **kwargs):
+        BaseElement.__init__(self, pos, **kwargs)
         self.text = text
         self.key = key
         self._getvalue = getvalue
         self.sysvar = sysvar
-        self.pos = pos
         self.font = font
         self._format = format
         self.align = align
@@ -157,7 +147,6 @@ class Element(object):
             self.leading = leading
         else:
             self.leading = max(1, int(font[1] * 0.4 + 0.5))
-        self.onrender = onrender
 
         self.report = None
         self.summary = 0 # used in SumElement, below
@@ -187,9 +176,9 @@ class Element(object):
         if self._getvalue is not None:
             return self._getvalue(row)
         if self.key is not None:
-            return row[self.key]
+            return (TextElement.text_conversion(self.text) if self.text is not None else "") + (row[self.key] if row[self.key] is not None else "")
         if self.text is not None:
-            return Element.text_conversion(self.text)
+            return TextElement.text_conversion(self.text)
         if self.sysvar is not None:
             return getattr(self.report, self.sysvar)
         return None
@@ -198,11 +187,11 @@ class Element(object):
     # which can be used to print the element out.
 
     def generate(self, row):
-        return Renderer(self, self.pos, self.font, self.gettext(row), self.align,
-            self.font[1] + self.leading, self.onrender, self.width)
+        return TextRenderer(self.font, self.gettext(row), self.align,
+            self.font[1] + self.leading, self.width, pos=self.pos, parent=self)
 
 
-class SumElement(Element):
+class SumElement(TextElement):
 
     def getvalue(self, row):
         rc = self.summary
@@ -215,6 +204,56 @@ class SumElement(Element):
             v = 0
         self.summary += v
 
+class ShapeRenderer(BaseRenderer):
+        
+    def __init__(self, height, width, shape, colors, fill, stroke, **kwargs):
+        BaseRenderer.__init__(self, **kwargs)
+        self.height = height
+        self.width = width
+        self.shape = shape
+        self.colors = colors
+        self.fill = fill
+        self.stroke = stroke
+
+    def render(self, offset, canvas):
+        BaseRenderer.render(self, offset, canvas)
+        
+        leftmargin = self.parent.report.leftmargin
+        canvas.saveState()
+        if self.colors is not None:
+            canvas.setFillColor(self.colors[(self.parent.report.rownumber-1) % len(self.colors)])
+        if self.shape == "rectangle":
+            canvas.rect(self.pos[0]+leftmargin,
+                    (-1) * (self.pos[1]+offset+self.height),
+                    self.width,
+                    self.height,
+                    fill=self.fill,
+                    stroke=self.stroke)
+        elif self.shape == "line":
+            canvas.line(self.pos[0]+leftmargin,
+                    (-1) * (self.pos[1]+offset),
+                    self.pos[0]+leftmargin+self.width,
+                    (-1) * (self.pos[1]+offset+self.height))
+        canvas.restoreState()
+class ShapeElement(BaseElement):
+    
+    def __init__(self, pos, shape, width, height=0, colors=None, bottomMargin=0, fill=True, stroke=True, **kwargs):
+        BaseElement.__init__(self, pos, **kwargs)
+        if shape in ["rectangle", "line"]:
+            self.shape = shape
+        #else:
+            #TODO: error
+        self.height = height
+        self.width = width
+        self.colors = colors
+        self.fill = fill
+        self.stroke = stroke
+        self.bottomMargin = bottomMargin
+        
+    def generate(self, row):
+        return ShapeRenderer(pos=self.pos, height=self.height,
+                 onrender=self.onrender, width=self.width, shape=self.shape,
+                 colors=self.colors, fill=self.fill, stroke=self.stroke, parent=self)
 
 class Rule(object):
 
@@ -315,7 +354,7 @@ class Band(object):
 
     def __init__(self, elements = None, childbands = None,
                  additionalbands = None, key = None, getvalue = None,
-                 newpagebefore = 0, newpageafter = 0):
+                 newpagebefore = 0, newpageafter = 0, backgrounds = None):
         self.elements = elements
         self.key = key
         self._getvalue = getvalue
@@ -324,6 +363,7 @@ class Band(object):
         self.newpageafter = newpageafter
         self.childbands = childbands or []
         self.additionalbands = additionalbands or []
+        self.backgrounds = backgrounds or []
 
     # generating a band creates a list of Renderer objects.
     # the first element of the list is a single integer
@@ -342,6 +382,13 @@ class Band(object):
                 renderer.applyoffset(elementlist[0])
                 elementlist.append(renderer)
             elementlist[0] += childlist[0]
+        if len(self.backgrounds) > 0:
+            numBackgrounds = 1
+            for background in self.backgrounds:
+                background.height = elementlist[0]-background.pos[1]-background.bottomMargin
+                renderer = background.generate(row)
+                elementlist.insert(numBackgrounds,renderer) # render backgrounds first, in order
+                numBackgrounds += 1
         return elementlist
 
     # summarize() is only used for total bands, i.e. group and
@@ -440,6 +487,8 @@ class Report(object):
                     element.report = self
                 self.setreference(band.childbands)
                 self.setreference(band.additionalbands)
+                for background in band.backgrounds:
+                    background.report = self
 
     def generate(self, canvas):
 
